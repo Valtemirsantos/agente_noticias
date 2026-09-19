@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
 
 
+logger = logging.getLogger(__name__)
 NEWS_API_URL = "https://newsapi.org/v2/top-headlines"
 NEWS_API_EVERYTHING_URL = "https://newsapi.org/v2/everything"
 PLACEHOLDER_API_KEYS = {
@@ -74,6 +76,32 @@ def _extrair_artigos(payload: dict[str, Any]) -> list[NewsArticle]:
 	return articles
 
 
+def _obter_payload(response: httpx.Response, endpoint: str) -> dict[str, Any]:
+	"""Valida uma resposta da NewsAPI sem registrar dados sensíveis."""
+	try:
+		response.raise_for_status()
+	except httpx.HTTPError as error:
+		logger.error("Falha HTTP na NewsAPI (%s): %s", endpoint, type(error).__name__)
+		raise RuntimeError("Não foi possível consultar a NewsAPI.") from error
+
+	try:
+		payload = response.json()
+	except ValueError as error:
+		logger.error("Resposta JSON inválida da NewsAPI (%s).", endpoint)
+		raise RuntimeError("A NewsAPI retornou uma resposta inválida.") from error
+
+	if not isinstance(payload, dict):
+		logger.error("Payload inesperado da NewsAPI (%s).", endpoint)
+		raise RuntimeError("A NewsAPI retornou uma resposta inválida.")
+
+	if payload.get("status") != "ok":
+		logger.warning("A NewsAPI retornou status de erro (%s).", endpoint)
+		message = payload.get("message", "status inválido")
+		raise RuntimeError(f"A NewsAPI retornou um erro: {message}")
+
+	return payload
+
+
 def buscar_noticias(
 	query: str | None = None,
 	*,
@@ -94,35 +122,37 @@ def buscar_noticias(
 		raise ValueError("page_size deve estar entre 1 e 100.")
 
 	params: dict[str, Any] = {
-		"apiKey": api_key,
 		"country": country,
 		"pageSize": page_size,
 	}
+	headers = {"X-Api-Key": api_key}
 	if query:
 		params["q"] = query
 	if category:
 		params["category"] = category
 
 	try:
-		response = httpx.get(NEWS_API_URL, params=params, timeout=timeout)
-		response.raise_for_status()
-		payload = response.json()
-		if payload.get("status") != "ok":
-			message = payload.get("message", "resposta inválida da NewsAPI")
-			raise RuntimeError(f"A NewsAPI retornou um erro: {message}")
+		logger.info("Consultando notícias na NewsAPI (country=%s, page_size=%s).", country, page_size)
+		response = httpx.get(NEWS_API_URL, params=params, headers=headers, timeout=timeout)
+		payload = _obter_payload(response, NEWS_API_URL)
 		articles = _extrair_artigos(payload)
 		if articles:
 			return articles
 		if not query and country == "br":
-			fallback_params = {"apiKey": api_key, "q": "Brasil", "sortBy": "publishedAt", "pageSize": page_size}
-			fallback_response = httpx.get(NEWS_API_EVERYTHING_URL, params=fallback_params, timeout=timeout)
-			fallback_response.raise_for_status()
-			fallback_payload = fallback_response.json()
-			if fallback_payload.get("status") == "ok":
-				return _extrair_artigos(fallback_payload)
+			logger.info("Busca principal sem resultados; executando fallback da NewsAPI.")
+			fallback_params = {"q": "Brasil", "sortBy": "publishedAt", "pageSize": page_size}
+			fallback_response = httpx.get(
+				NEWS_API_EVERYTHING_URL,
+				params=fallback_params,
+				headers=headers,
+				timeout=timeout,
+			)
+			fallback_payload = _obter_payload(fallback_response, NEWS_API_EVERYTHING_URL)
+			return _extrair_artigos(fallback_payload)
 		return articles
 	except httpx.HTTPError as error:
-		raise RuntimeError(f"Não foi possível consultar a NewsAPI: {error}") from error
+		logger.error("Falha de transporte na NewsAPI: %s", type(error).__name__)
+		raise RuntimeError("Não foi possível consultar a NewsAPI.") from error
 
 
 def buscar_noticias_para_agente(
